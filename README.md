@@ -4,6 +4,14 @@ A C# implementation for creating and training extremely small GPT-2 style models
 
 The final exported GGUF model is only **~440 KB**, making it suitable for highly constrained environments.
 
+<details>
+  <summary>Click to view the image</summary>
+
+  ![llama.cpp](llamacpp.png)
+
+  ![LM Studio](lmstudio.png)
+</details>
+
 ## Features
 
 - **100% C#**: Model definition, training loop, and GGUF exporter are all written in C# using ILGPU.
