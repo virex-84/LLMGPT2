@@ -2,6 +2,8 @@
 
 using ILGPU;
 using ILGPU.Runtime;
+using ILGPU.Runtime.CPU;
+using ILGPU.Runtime.Cuda;
 using ILGPU.Runtime.OpenCL;
 
 namespace LLM.ILGPU;
@@ -14,21 +16,36 @@ public class Context : IDisposable
 
     public Context()
     {
-        _context = global::ILGPU.Context.Create(builder => builder.OpenCL());
-        var devices = _context.GetCLDevices();
-        if (devices.Count == 0)
+        var _context = global::ILGPU.Context.Create(builder => builder.AllAccelerators());
+
+        Console.WriteLine("Доступные устройства:");
+        var devices = _context.Devices;
+
+        if (devices.Length == 0)
             throw new InvalidOperationException(
                 "OpenCL устройства не найдены.");
 
-        _accelerator = devices[0].CreateAccelerator(_context);
+        for (int i = 0; i < devices.Length; i++)
+        {
+            Console.WriteLine($"[{i}] {devices[i].AcceleratorType}: {devices[i].Name}");
+        }
 
-        Console.WriteLine($"=== GPU INFO ===");
-        Console.WriteLine($"Device: {_accelerator.Name}");
-        Console.WriteLine($"Type: {_accelerator.AcceleratorType}");
-        Console.WriteLine($"Memory: {_accelerator.MemorySize / (1024 * 1024)} MB");
-        Console.WriteLine($"Max threads/group: {_accelerator.MaxNumThreadsPerGroup}");
-        Console.WriteLine($"Warp size: {_accelerator.WarpSize}");
-        Console.WriteLine("================\n");
+    choice:
+        Console.Write("\nВыберите номер устройства: ");
+        if (int.TryParse(Console.ReadLine(), out int choice) && choice >= 0 && choice < devices.Length)
+        {
+            var selectedDevice = devices[choice];
+
+            // 5. Создаем акселератор на основе выбранного устройства
+            _accelerator = selectedDevice.CreateAccelerator(_context);
+        }
+        else
+        {
+            Console.WriteLine("Некорректный выбор.");
+            goto choice;
+        }
+
+        devices[choice].PrintInformation(Console.Out);
     }
 
     public Accelerator Accelerator => _accelerator;
