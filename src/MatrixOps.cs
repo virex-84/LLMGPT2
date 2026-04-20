@@ -1,130 +1,105 @@
 //https://github.com/virex-84
-
 using ILGPU;
-using ILGPU.Runtime;
 using ILGPU.Algorithms;
+using ILGPU.Runtime;
+using System.Runtime.CompilerServices;
 
 namespace LLM.ILGPU;
 
 public static class MatrixOps
 {
-    private static Action<Index1D, ArrayView1D<float, Stride1D.Dense>,
-        SpecializedValue<float>,
-        ArrayView1D<uint, Stride1D.Dense>>? _cachedRandomNormalInitKernel;
-    private static Action<Index1D, ArrayView1D<float, Stride1D.Dense>,
-        ArrayView1D<float, Stride1D.Dense>>? _cachedReluKernel;
-    private static Action<Index1D, ArrayView1D<float, Stride1D.Dense>,
-        ArrayView1D<float, Stride1D.Dense>,
-        ArrayView1D<float, Stride1D.Dense>>? _cachedReluGradKernel;
-    private static Action<Index1D, ArrayView1D<float, Stride1D.Dense>,
-        ArrayView1D<float, Stride1D.Dense>, int>? _cachedSoftmaxKernel;
-    private static Action<Index1D, ArrayView1D<float, Stride1D.Dense>,
-        ArrayView1D<int, Stride1D.Dense>, int>? _cachedGreedyDecodeKernel;
-    private static Action<Index1D, ArrayView1D<float, Stride1D.Dense>,
-        ArrayView1D<float, Stride1D.Dense>,
-        ArrayView1D<float, Stride1D.Dense>>? _cachedResidualAddKernel;
-    private static Action<Index1D, ArrayView1D<float, Stride1D.Dense>,
-        ArrayView1D<float, Stride1D.Dense>>? _cachedNormKernel;
-    private static Action<Index1D, ArrayView1D<float, Stride1D.Dense>,
-        float>? _cachedScaleGradsKernel;
+    // ── Кэш per-accelerator через слабые ссылки ───────────────────
+    // Статический кэш без привязки к accelerator опасен при
+    // использовании нескольких устройств (AMD + NVIDIA одновременно)
+    private static readonly
+        ConditionalWeakTable<Accelerator, MatrixOpsKernelCache> _kernelCaches = new();
 
+    private static MatrixOpsKernelCache GetCache(Accelerator accelerator)
+        => _kernelCaches.GetOrCreateValue(accelerator);
+
+    // ─────────────────────────────────────────────────────────────
     public static void ZeroInit(Accelerator accelerator,
         MemoryBuffer1D<float, Stride1D.Dense> buffer)
     {
         buffer.MemSetToZero();
     }
 
+    // ─────────────────────────────────────────────────────────────
     public static void RandomNormalInit(Accelerator accelerator,
         MemoryBuffer1D<float, Stride1D.Dense> buffer, float std)
     {
-        _cachedRandomNormalInitKernel ??=
-            accelerator.LoadAutoGroupedStreamKernel<Index1D,
-                ArrayView1D<float, Stride1D.Dense>, SpecializedValue<float>,
-                ArrayView1D<uint, Stride1D.Dense>>(RandomNormalInitKernel);
+        var cache = GetCache(accelerator);
+        cache.EnsureRandomNormalInit(accelerator);
 
-        var seedBuffer = accelerator.Allocate1D(
-            new uint[] { (uint)DateTime.Now.Millisecond });
-        _cachedRandomNormalInitKernel(new Index1D((int)buffer.Length),
-            buffer.View, SpecializedValue.New(std), seedBuffer.View);
-        seedBuffer.Dispose();
+        // Seed: комбинируем время + хэш буфера для уникальности
+        uint seed = (uint)(DateTime.Now.Ticks & 0xFFFFFFFF);
+
+        using var seedBuffer = accelerator.Allocate1D(new uint[] { seed });
+
+        cache.RandomNormalInitKernel!(
+            new Index1D((int)buffer.Length),
+            buffer.View,
+            SpecializedValue.New(std),
+            seedBuffer.View);
+
+        accelerator.Synchronize();
     }
 
+    // ─────────────────────────────────────────────────────────────
     public static void Softmax(Accelerator accelerator,
         ArrayView1D<float, Stride1D.Dense> input,
-        MemoryBuffer1D<float, Stride1D.Dense> output, int rows, int cols)
+        MemoryBuffer1D<float, Stride1D.Dense> output,
+        int rows, int cols)
     {
-        _cachedSoftmaxKernel ??= accelerator.LoadAutoGroupedStreamKernel<Index1D,
-            ArrayView1D<float, Stride1D.Dense>,
-            ArrayView1D<float, Stride1D.Dense>, int>(
-            (rowIdx, inView, outView, c) =>
-            {
-                int offset = rowIdx * c;
-                float maxVal = float.NegativeInfinity;
-                for (int j = 0; j < c; j++)
-                    maxVal = XMath.Max(maxVal, inView[offset + j]);
-
-                float sum = 0;
-                for (int j = 0; j < c; j++)
-                {
-                    float e = XMath.Exp(inView[offset + j] - maxVal);
-                    outView[offset + j] = e;
-                    sum += e;
-                }
-                for (int j = 0; j < c; j++)
-                    outView[offset + j] /= sum;
-            });
-        _cachedSoftmaxKernel(rows, input, output.View, cols);
+        var cache = GetCache(accelerator);
+        cache.EnsureSoftmax(accelerator);
+        cache.SoftmaxKernel!(rows, input, output.View, cols);
     }
 
+    // ─────────────────────────────────────────────────────────────
     public static void ClipGradients(Accelerator accelerator,
-        ArrayView1D<float, Stride1D.Dense> grads, float maxNorm,
+        ArrayView1D<float, Stride1D.Dense> grads,
+        float maxNorm,
         MemoryBuffer1D<float, Stride1D.Dense> normBuffer)
     {
         normBuffer.MemSetToZero();
 
-        _cachedNormKernel ??= accelerator.LoadAutoGroupedStreamKernel<Index1D,
-            ArrayView1D<float, Stride1D.Dense>,
-            ArrayView1D<float, Stride1D.Dense>>(
-            (index, g, normBuf) =>
-            {
-                float val = g[index];
-                Atomic.Add(ref normBuf[0], val * val);
-            });
+        var cache = GetCache(accelerator);
+        cache.EnsureClipGradients(accelerator);
 
-        _cachedNormKernel((Index1D)grads.Length, grads, normBuffer.View);
+        cache.NormKernel!((Index1D)grads.Length, grads, normBuffer.View);
 
         float[] normHost = new float[1];
         normBuffer.CopyToCPU(normHost);
-        float totalNorm = (float)Math.Sqrt(normHost[0]);
+        float totalNorm = XMath.Sqrt(normHost[0]);   // CPU — ок
 
         if (totalNorm > maxNorm)
         {
             float scale = maxNorm / (totalNorm + 1e-6f);
-            _cachedScaleGradsKernel ??=
-                accelerator.LoadAutoGroupedStreamKernel<Index1D,
-                    ArrayView1D<float, Stride1D.Dense>, float>(
-                    (idx, g, s) => { g[idx] *= s; });
-            _cachedScaleGradsKernel((int)grads.Length, grads, scale);
+            cache.ScaleGradsKernel!((int)grads.Length, grads, scale);
         }
     }
 
-    /// <summary>
-    /// ✅ Детерминированный хэш от индекса — нет race condition на seed[0].
-    /// </summary>
-    public static void RandomNormalInitKernel(Index1D index,
+    // ─────────────────────────────────────────────────────────────
+    // GPU kernel — все Math.* заменены на XMath.*
+    // ─────────────────────────────────────────────────────────────
+    public static void RandomNormalInitKernel(
+        Index1D index,
         ArrayView1D<float, Stride1D.Dense> output,
         SpecializedValue<float> stdDev,
         ArrayView1D<uint, Stride1D.Dense> seed)
     {
         uint baseSeed = seed[0];
 
+        // Box-Muller: нужны два независимых равномерных числа
         uint s1 = baseSeed + (uint)index * 12345u + 1u;
         s1 = (s1 ^ 61u) ^ (s1 >> 16);
         s1 += s1 << 3;
         s1 ^= s1 >> 4;
         s1 *= 0x27d4eb2du;
         s1 ^= s1 >> 15;
-        float u1 = (s1 % 10000 + 1) / 10000.0f;
+        // Нормируем в (0, 1] — избегаем log(0)
+        float u1 = (float)(s1 % 999983u + 1u) / 999984.0f;
 
         uint s2 = baseSeed + (uint)index * 67890u + 2u;
         s2 = (s2 ^ 61u) ^ (s2 >> 16);
@@ -132,10 +107,144 @@ public static class MatrixOps
         s2 ^= s2 >> 4;
         s2 *= 0x27d4eb2du;
         s2 ^= s2 >> 15;
-        float u2 = (s2 % 10000 + 1) / 10000.0f;
+        float u2 = (float)(s2 % 999983u + 1u) / 999984.0f;
 
-        float z0 = (float)Math.Sqrt(-2.0 * Math.Log(u1)) *
-                    (float)Math.Cos(2.0 * 3.14159265359 * u2);
+        // ✅ XMath.Log / XMath.Sqrt / XMath.Cos — работают на PTX и OpenCL
+        float z0 = XMath.Sqrt(-2.0f * XMath.Log(u1))
+                 * XMath.Cos(2.0f * 3.14159265359f * u2);
+
         output[index] = stdDev * z0;
+    }
+
+    // ─────────────────────────────────────────────────────────────
+    // Softmax kernel (статический метод — не лямбда, лучше для PTX)
+    // ─────────────────────────────────────────────────────────────
+    public static void SoftmaxKernelImpl(
+        Index1D rowIdx,
+        ArrayView1D<float, Stride1D.Dense> inView,
+        ArrayView1D<float, Stride1D.Dense> outView,
+        int c)
+    {
+        int offset = rowIdx * c;
+
+        // Проход 1: max (численная стабильность)
+        float maxVal = float.NegativeInfinity;
+        for (int j = 0; j < c; j++)
+            maxVal = XMath.Max(maxVal, inView[offset + j]);
+
+        // Проход 2: exp + sum, развёртка x4
+        float sum0 = 0f, sum1 = 0f, sum2 = 0f, sum3 = 0f;
+        int k = 0;
+        int limit4 = c - (c % 4);
+        for (; k < limit4; k += 4)
+        {
+            float e0 = XMath.Exp(inView[offset + k] - maxVal);
+            float e1 = XMath.Exp(inView[offset + k + 1] - maxVal);
+            float e2 = XMath.Exp(inView[offset + k + 2] - maxVal);
+            float e3 = XMath.Exp(inView[offset + k + 3] - maxVal);
+            outView[offset + k] = e0;
+            outView[offset + k + 1] = e1;
+            outView[offset + k + 2] = e2;
+            outView[offset + k + 3] = e3;
+            sum0 += e0; sum1 += e1; sum2 += e2; sum3 += e3;
+        }
+        float sum = sum0 + sum1 + sum2 + sum3;
+        for (; k < c; k++)
+        {
+            float e = XMath.Exp(inView[offset + k] - maxVal);
+            outView[offset + k] = e;
+            sum += e;
+        }
+
+        // Проход 3: нормировка, развёртка x4
+        float invSum = 1.0f / sum;
+        k = 0;
+        for (; k < limit4; k += 4)
+        {
+            outView[offset + k] *= invSum;
+            outView[offset + k + 1] *= invSum;
+            outView[offset + k + 2] *= invSum;
+            outView[offset + k + 3] *= invSum;
+        }
+        for (; k < c; k++)
+            outView[offset + k] *= invSum;
+    }
+
+    // ─────────────────────────────────────────────────────────────
+    // Norm kernel (для ClipGradients)
+    // ─────────────────────────────────────────────────────────────
+    public static void NormKernelImpl(
+        Index1D index,
+        ArrayView1D<float, Stride1D.Dense> g,
+        ArrayView1D<float, Stride1D.Dense> normBuf)
+    {
+        float val = g[index];
+        Atomic.Add(ref normBuf[0], val * val);
+    }
+
+    public static void ScaleGradsKernelImpl(
+        Index1D idx,
+        ArrayView1D<float, Stride1D.Dense> g,
+        float scale)
+    {
+        g[idx] *= scale;
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// Кэш kernel-ов per-accelerator
+// ═══════════════════════════════════════════════════════════════════
+internal sealed class MatrixOpsKernelCache
+{
+    public Action<Index1D,
+        ArrayView1D<float, Stride1D.Dense>,
+        SpecializedValue<float>,
+        ArrayView1D<uint, Stride1D.Dense>>? RandomNormalInitKernel;
+
+    public Action<Index1D,
+        ArrayView1D<float, Stride1D.Dense>,
+        ArrayView1D<float, Stride1D.Dense>,
+        int>? SoftmaxKernel;
+
+    public Action<Index1D,
+        ArrayView1D<float, Stride1D.Dense>,
+        ArrayView1D<float, Stride1D.Dense>>? NormKernel;
+
+    public Action<Index1D,
+        ArrayView1D<float, Stride1D.Dense>,
+        float>? ScaleGradsKernel;
+
+    // ── Ленивая инициализация ──────────────────────────────────
+    public void EnsureRandomNormalInit(Accelerator acc)
+    {
+        RandomNormalInitKernel ??= acc.LoadAutoGroupedStreamKernel<
+            Index1D,
+            ArrayView1D<float, Stride1D.Dense>,
+            SpecializedValue<float>,
+            ArrayView1D<uint, Stride1D.Dense>>(
+            MatrixOps.RandomNormalInitKernel);
+    }
+
+    public void EnsureSoftmax(Accelerator acc)
+    {
+        SoftmaxKernel ??= acc.LoadAutoGroupedStreamKernel<
+            Index1D,
+            ArrayView1D<float, Stride1D.Dense>,
+            ArrayView1D<float, Stride1D.Dense>,
+            int>(MatrixOps.SoftmaxKernelImpl);
+    }
+
+    public void EnsureClipGradients(Accelerator acc)
+    {
+        NormKernel ??= acc.LoadAutoGroupedStreamKernel<
+            Index1D,
+            ArrayView1D<float, Stride1D.Dense>,
+            ArrayView1D<float, Stride1D.Dense>>(
+            MatrixOps.NormKernelImpl);
+
+        ScaleGradsKernel ??= acc.LoadAutoGroupedStreamKernel<
+            Index1D,
+            ArrayView1D<float, Stride1D.Dense>,
+            float>(MatrixOps.ScaleGradsKernelImpl);
     }
 }
