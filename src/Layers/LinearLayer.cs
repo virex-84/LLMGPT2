@@ -2,11 +2,17 @@
 
 using ILGPU;
 using ILGPU.Runtime;
+using ILGPU.Algorithms;
 
 namespace LLM.ILGPU;
 
 public static class LinearKernels
 {
+    // ─────────────────────────────────────────────────────────────
+    // Forward: output[i,j] = sum_k(input[i,k] * weight[k,j]) + bias[j]
+    // Разворот x4 по внутреннему циклу (inFeatures)
+    // gfx1150: доступ к weight[k,j] — stride по outFeatures (coalesced по j)
+    // ─────────────────────────────────────────────────────────────
     public static void LinearForwardKernel(
         Index2D index,
         ArrayView1D<float, Stride1D.Dense> input,
@@ -21,13 +27,33 @@ public static class LinearKernels
         int j = index.Y;
         if (i >= seqLen || j >= outFeatures) return;
 
-        float sum = 0;
-        for (int k = 0; k < inFeatures; k++)
-            sum += input[i * inFeatures + k] * weight[k * outFeatures + j];
+        int inF = inFeatures;
+        int outF = outFeatures;
 
-        output[i * outFeatures + j] = sum + bias[j];
+        float s0 = 0f, s1 = 0f, s2 = 0f, s3 = 0f;
+        int k = 0;
+        int limit4 = inF - (inF % 4);
+
+        for (; k < limit4; k += 4)
+        {
+            // input[i, k..k+3] — последовательный доступ (хорошо)
+            // weight[k..k+3, j] — stride=outF (для разных j в warp: coalesced)
+            s0 += input[i * inF + k] * weight[k * outF + j];
+            s1 += input[i * inF + k + 1] * weight[(k + 1) * outF + j];
+            s2 += input[i * inF + k + 2] * weight[(k + 2) * outF + j];
+            s3 += input[i * inF + k + 3] * weight[(k + 3) * outF + j];
+        }
+        float sum = s0 + s1 + s2 + s3;
+        for (; k < inF; k++)
+            sum += input[i * inF + k] * weight[k * outF + j];
+
+        output[i * outF + j] = sum + bias[j];
     }
 
+    // ─────────────────────────────────────────────────────────────
+    // WeightGrad: gradWeight[k,j] = sum_i(input[i,k] * gradOutput[i,j])
+    // Разворот x4 по seqLen
+    // ─────────────────────────────────────────────────────────────
     public static void LinearWeightGradKernel(
         Index2D index,
         ArrayView1D<float, Stride1D.Dense> input,
@@ -41,14 +67,31 @@ public static class LinearKernels
         int j = index.Y;
         if (k >= inFeatures || j >= outFeatures) return;
 
-        float sum = 0;
-        for (int i = 0; i < seqLen; i++)
-            sum += input[i * inFeatures + k] * gradOutput[i * outFeatures + j];
+        int inF = inFeatures;
+        int outF = outFeatures;
 
-        gradWeight[k * outFeatures + j] = sum;
+        float s0 = 0f, s1 = 0f, s2 = 0f, s3 = 0f;
+        int i = 0;
+        int limit4 = seqLen - (seqLen % 4);
+
+        for (; i < limit4; i += 4)
+        {
+            s0 += input[i * inF + k] * gradOutput[i * outF + j];
+            s1 += input[(i + 1) * inF + k] * gradOutput[(i + 1) * outF + j];
+            s2 += input[(i + 2) * inF + k] * gradOutput[(i + 2) * outF + j];
+            s3 += input[(i + 3) * inF + k] * gradOutput[(i + 3) * outF + j];
+        }
+        float sum = s0 + s1 + s2 + s3;
+        for (; i < seqLen; i++)
+            sum += input[i * inF + k] * gradOutput[i * outF + j];
+
+        gradWeight[k * outF + j] = sum;
     }
 
-    // ✅ Убрано деление на seqLen — масштаб должен совпадать с weight grad
+    // ─────────────────────────────────────────────────────────────
+    // BiasGrad: gradBias[j] = sum_i(gradOutput[i,j])
+    // Разворот x4 по seqLen
+    // ─────────────────────────────────────────────────────────────
     public static void LinearBiasGradKernel(
         Index1D index,
         ArrayView1D<float, Stride1D.Dense> gradOutput,
@@ -57,13 +100,31 @@ public static class LinearKernels
         SpecializedValue<int> outFeatures)
     {
         int j = index;
-        float sum = 0;
-        for (int i = 0; i < seqLen; i++)
-            sum += gradOutput[i * outFeatures + j];
+        int outF = outFeatures;
+
+        float s0 = 0f, s1 = 0f, s2 = 0f, s3 = 0f;
+        int i = 0;
+        int limit4 = seqLen - (seqLen % 4);
+
+        for (; i < limit4; i += 4)
+        {
+            s0 += gradOutput[i * outF + j];
+            s1 += gradOutput[(i + 1) * outF + j];
+            s2 += gradOutput[(i + 2) * outF + j];
+            s3 += gradOutput[(i + 3) * outF + j];
+        }
+        float sum = s0 + s1 + s2 + s3;
+        for (; i < seqLen; i++)
+            sum += gradOutput[i * outF + j];
 
         gradBias[j] = sum;
     }
 
+    // ─────────────────────────────────────────────────────────────
+    // InputGrad: gradInput[i,k] = sum_j(gradOutput[i,j] * weight[k,j])
+    // Разворот x4 по outFeatures
+    // weight[k,j] читается как weight[k*outF + j] — для разных k в warp
+    // ─────────────────────────────────────────────────────────────
     public static void LinearInputGradKernel(
         Index2D index,
         ArrayView1D<float, Stride1D.Dense> gradOutput,
@@ -77,14 +138,31 @@ public static class LinearKernels
         int k = index.Y;
         if (i >= seqLen || k >= inFeatures) return;
 
-        float sum = 0;
-        for (int j = 0; j < outFeatures; j++)
-            sum += gradOutput[i * outFeatures + j] * weight[k * outFeatures + j];
+        int inF = inFeatures;
+        int outF = outFeatures;
 
-        gradInput[i * inFeatures + k] = sum;
+        float s0 = 0f, s1 = 0f, s2 = 0f, s3 = 0f;
+        int j = 0;
+        int limit4 = outF - (outF % 4);
+
+        for (; j < limit4; j += 4)
+        {
+            // gradOutput[i, j..j+3]: последовательный доступ
+            // weight[k, j..j+3]: последовательный доступ
+            s0 += gradOutput[i * outF + j] * weight[k * outF + j];
+            s1 += gradOutput[i * outF + j + 1] * weight[k * outF + j + 1];
+            s2 += gradOutput[i * outF + j + 2] * weight[k * outF + j + 2];
+            s3 += gradOutput[i * outF + j + 3] * weight[k * outF + j + 3];
+        }
+        float sum = s0 + s1 + s2 + s3;
+        for (; j < outF; j++)
+            sum += gradOutput[i * outF + j] * weight[k * outF + j];
+
+        gradInput[i * inF + k] = sum;
     }
 }
 
+// ═══════════════════════════════════════════════════════════════════
 public class LinearLayer : ILayer
 {
     private readonly Accelerator _accelerator;
@@ -102,22 +180,26 @@ public class LinearLayer : ILayer
     private ArrayView1D<float, Stride1D.Dense> _cachedInputView;
     private int _cachedSeqLen;
 
-    private readonly Action<Index2D, ArrayView1D<float, Stride1D.Dense>,
+    private readonly Action<Index2D,
+        ArrayView1D<float, Stride1D.Dense>,
         ArrayView1D<float, Stride1D.Dense>,
         ArrayView1D<float, Stride1D.Dense>,
         ArrayView1D<float, Stride1D.Dense>,
         int, SpecializedValue<int>, SpecializedValue<int>> _forwardKernel;
 
-    private readonly Action<Index2D, ArrayView1D<float, Stride1D.Dense>,
+    private readonly Action<Index2D,
+        ArrayView1D<float, Stride1D.Dense>,
         ArrayView1D<float, Stride1D.Dense>,
         ArrayView1D<float, Stride1D.Dense>,
         int, SpecializedValue<int>, SpecializedValue<int>> _weightGradKernel;
 
-    private readonly Action<Index1D, ArrayView1D<float, Stride1D.Dense>,
+    private readonly Action<Index1D,
+        ArrayView1D<float, Stride1D.Dense>,
         ArrayView1D<float, Stride1D.Dense>,
         int, SpecializedValue<int>> _biasGradKernel;
 
-    private readonly Action<Index2D, ArrayView1D<float, Stride1D.Dense>,
+    private readonly Action<Index2D,
+        ArrayView1D<float, Stride1D.Dense>,
         ArrayView1D<float, Stride1D.Dense>,
         ArrayView1D<float, Stride1D.Dense>,
         int, SpecializedValue<int>, SpecializedValue<int>> _inputGradKernel;
@@ -149,25 +231,34 @@ public class LinearLayer : ILayer
         MatrixOps.RandomNormalInit(accelerator, _weight, std);
         MatrixOps.ZeroInit(accelerator, _bias);
 
-        _forwardKernel = accelerator.LoadAutoGroupedStreamKernel<Index2D,
-            ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
-            ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
+        _forwardKernel = accelerator.LoadAutoGroupedStreamKernel<
+            Index2D,
+            ArrayView1D<float, Stride1D.Dense>,
+            ArrayView1D<float, Stride1D.Dense>,
+            ArrayView1D<float, Stride1D.Dense>,
+            ArrayView1D<float, Stride1D.Dense>,
             int, SpecializedValue<int>, SpecializedValue<int>>(
             LinearKernels.LinearForwardKernel);
 
-        _weightGradKernel = accelerator.LoadAutoGroupedStreamKernel<Index2D,
-            ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
+        _weightGradKernel = accelerator.LoadAutoGroupedStreamKernel<
+            Index2D,
+            ArrayView1D<float, Stride1D.Dense>,
+            ArrayView1D<float, Stride1D.Dense>,
             ArrayView1D<float, Stride1D.Dense>,
             int, SpecializedValue<int>, SpecializedValue<int>>(
             LinearKernels.LinearWeightGradKernel);
 
-        _biasGradKernel = accelerator.LoadAutoGroupedStreamKernel<Index1D,
-            ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
+        _biasGradKernel = accelerator.LoadAutoGroupedStreamKernel<
+            Index1D,
+            ArrayView1D<float, Stride1D.Dense>,
+            ArrayView1D<float, Stride1D.Dense>,
             int, SpecializedValue<int>>(
             LinearKernels.LinearBiasGradKernel);
 
-        _inputGradKernel = accelerator.LoadAutoGroupedStreamKernel<Index2D,
-            ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
+        _inputGradKernel = accelerator.LoadAutoGroupedStreamKernel<
+            Index2D,
+            ArrayView1D<float, Stride1D.Dense>,
+            ArrayView1D<float, Stride1D.Dense>,
             ArrayView1D<float, Stride1D.Dense>,
             int, SpecializedValue<int>, SpecializedValue<int>>(
             LinearKernels.LinearInputGradKernel);
@@ -182,17 +273,21 @@ public class LinearLayer : ILayer
         ArrayView1D<float, Stride1D.Dense> input, int seqLen)
     {
         if (seqLen <= 0)
-            throw new ArgumentException($"seqLen должен быть > 0, получено {seqLen}");
+            throw new ArgumentException(
+                $"seqLen должен быть > 0, получено {seqLen}");
 
         int inputSize = seqLen * _inFeatures;
+        int outputSize = seqLen * _outFeatures;
         _cachedSeqLen = seqLen;
         _cachedInputView = input.SubView(0, inputSize);
 
-        int outputSize = seqLen * _outFeatures;
         var outputView = _outputBuffer.View.SubView(0, outputSize);
 
         _forwardKernel(new Index2D(seqLen, _outFeatures),
-            _cachedInputView, _weight.View, _bias.View, outputView,
+            _cachedInputView,
+            _weight.View,
+            _bias.View,
+            outputView,
             seqLen,
             SpecializedValue.New(_inFeatures),
             SpecializedValue.New(_outFeatures));
@@ -208,22 +303,29 @@ public class LinearLayer : ILayer
                 "Forward должен быть вызван перед Backward");
 
         int seqLen = _cachedSeqLen;
+        int inputSize = seqLen * _inFeatures;
 
+        // WeightGrad и BiasGrad можно запустить независимо (нет зависимостей)
         _weightGradKernel(new Index2D(_inFeatures, _outFeatures),
-            _cachedInputView, grads, _gradWeight.View,
+            _cachedInputView,
+            grads,
+            _gradWeight.View,
             seqLen,
             SpecializedValue.New(_inFeatures),
             SpecializedValue.New(_outFeatures));
 
         _biasGradKernel(new Index1D(_outFeatures),
-            grads, _gradBias.View,
-            seqLen, SpecializedValue.New(_outFeatures));
+            grads,
+            _gradBias.View,
+            seqLen,
+            SpecializedValue.New(_outFeatures));
 
-        int inputSize = seqLen * _inFeatures;
         var gradInputView = _gradInputBuffer.View.SubView(0, inputSize);
 
         _inputGradKernel(new Index2D(seqLen, _inFeatures),
-            grads, _weight.View, gradInputView,
+            grads,
+            _weight.View,
+            gradInputView,
             seqLen,
             SpecializedValue.New(_inFeatures),
             SpecializedValue.New(_outFeatures));

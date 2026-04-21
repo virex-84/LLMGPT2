@@ -19,4 +19,9 @@
   </None>
 </ItemGroup>
 
+<ItemGroup>
+  <None Remove="src\data\chat_training_data_big.json" />
+  <None Remove="src\data\chat_training_data_big.json" />
+</ItemGroup>
+
 </Project>

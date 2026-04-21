@@ -154,7 +154,7 @@ public class BPETokenizer : ITokenizer
             {
                 Vocab[st] = idx++;
                 if (verbose)
-                    Console.WriteLine($"  [special] '{st}' => {idx - 1}");
+                    Console.WriteLine($"[special] '{st}' => {idx - 1}");
             }
         }
 
@@ -256,7 +256,9 @@ public class BPETokenizer : ITokenizer
     /// </summary>
     private void VerifySpecialTokens(bool verbose)
     {
-        Console.WriteLine("\n[ВЕРИФИКАЦИЯ СПЕЦТОКЕНОВ]");
+        if (verbose)
+            Console.WriteLine("\n[ВЕРИФИКАЦИЯ СПЕЦТОКЕНОВ]");
+
         bool ok = true;
         foreach (var st in SpecialTokensOrder)
         {
@@ -267,7 +269,8 @@ public class BPETokenizer : ITokenizer
             }
             else
             {
-                Console.WriteLine($"  ❌ '{st}' НЕ НАЙДЕН в vocab!");
+                if (verbose)
+                    Console.WriteLine($"  ❌ '{st}' НЕ НАЙДЕН в vocab!");
                 ok = false;
             }
         }
@@ -280,14 +283,17 @@ public class BPETokenizer : ITokenizer
             {
                 if (actualId != expectedIds[i])
                 {
-                    Console.WriteLine(
+                    if (verbose)
+                        Console.WriteLine(
                         $"  ⚠️ '{SpecialTokensOrder[i]}' имеет id={actualId}," +
                         $" ожидалось {expectedIds[i]}");
                 }
             }
         }
 
-        if (ok) Console.WriteLine("  ✅ Все спецтокены корректны");
+        if (verbose)
+            if (ok)
+                Console.WriteLine("  ✅ Все спецтокены корректны");
     }
 
     // ═══════════════════════════════════════════════════════

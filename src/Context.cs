@@ -16,36 +16,71 @@ public class Context : IDisposable
 
     public Context()
     {
-        var _context = global::ILGPU.Context.Create(builder => builder.AllAccelerators());
+        _context = global::ILGPU.Context.Create(builder =>
+            builder
+                .AllAccelerators()
+                // ── Производительность ───────────────────────────
+                // O2: дорогие трансформации — лучший код kernels
+                .Optimize(OptimizationLevel.O2)
 
-        Console.WriteLine("Доступные устройства:");
+                // Aggressive: все функции инлайнятся
+                // убирает overhead вызовов внутри kernel
+                .Inlining(InliningMode.Aggressive)
+
+                // Fast32BitOnly: все double → float автоматически
+                // для нейросетей double не нужен, float быстрее
+                // На AMD iGPU float в 2-4x быстрее double
+                .Math(MathMode.Fast32BitOnly)
+
+                // ── Параллельная генерация кода ──────────────────
+                // Компилирует разные kernels параллельно на CPU
+                // Ускоряет первый WarmUp
+                .PageLocking(PageLockingMode.Auto)
+
+                // ── Алгоритмы ────────────────────────────────────
+                // Обязательно для XMath.Log/Exp/Sqrt
+                .EnableAlgorithms()
+
+                // ── Debug отключаем ──────────────────────────────
+                // Без отладчика — никаких debug символов
+                .DebugSymbols(DebugSymbolsMode.Disabled)
+                );
+
         var devices = _context.Devices;
 
         if (devices.Length == 0)
-            throw new InvalidOperationException(
-                "OpenCL устройства не найдены.");
+            throw new InvalidOperationException("Устройства не найдены.");
 
+        Console.WriteLine("Доступные устройства:");
         for (int i = 0; i < devices.Length; i++)
         {
             Console.WriteLine($"[{i}] {devices[i].AcceleratorType}: {devices[i].Name}");
         }
 
-    choice:
-        Console.Write("\nВыберите номер устройства: ");
-        if (int.TryParse(Console.ReadLine(), out int choice) && choice >= 0 && choice < devices.Length)
+        int selectedIndex = -1;
+        while (selectedIndex < 0)
         {
-            var selectedDevice = devices[choice];
+            Console.Write("\nВыберите номер устройства: ");
+            string? input = Console.ReadLine();
 
-            // 5. Создаем акселератор на основе выбранного устройства
-            _accelerator = selectedDevice.CreateAccelerator(_context);
-        }
-        else
-        {
-            Console.WriteLine("Некорректный выбор.");
-            goto choice;
+            if (int.TryParse(input, out int idx)
+                && idx >= 0
+                && idx < devices.Length)
+            {
+                selectedIndex = idx;
+            }
+            else
+            {
+                Console.WriteLine(
+                    $"  Некорректный выбор. Введите число от 0 до " +
+                    $"{devices.Length - 1}.");
+            }
         }
 
-        devices[choice].PrintInformation(Console.Out);
+        _accelerator = devices[selectedIndex].CreateAccelerator(_context);
+
+        devices[selectedIndex].PrintInformation(Console.Out);
+        Console.WriteLine();
     }
 
     public Accelerator Accelerator => _accelerator;
@@ -54,8 +89,8 @@ public class Context : IDisposable
     {
         if (!_disposed)
         {
-            _accelerator.Dispose();
-            _context.Dispose();
+            _accelerator?.Dispose();
+            _context?.Dispose();
             _disposed = true;
         }
     }

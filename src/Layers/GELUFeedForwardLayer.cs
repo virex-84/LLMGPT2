@@ -3,159 +3,182 @@
 using ILGPU;
 using ILGPU.Runtime;
 using ILGPU.Algorithms;
-using System;
 
 namespace LLM.ILGPU;
 
-/// <summary>
-/// Кернели для GELU активации.
-/// Approximation: 0.5 * x * (1 + tanh(sqrt(2/π) * (x + 0.044715 * x³)))
-/// </summary>
 public static class GELUKernels
 {
-    /// <summary>
-    /// GELU forward pass.
-    /// </summary>
+    private const float Coeff = 0.044715f;
+    private const float Sqrt2OverPi = 0.7978845608f;
+
     public static void GELUForwardKernel(
         Index1D index,
         ArrayView1D<float, Stride1D.Dense> input,
-        ArrayView1D<float, Stride1D.Dense> output)
+        ArrayView1D<float, Stride1D.Dense> output,
+        ArrayView1D<float, Stride1D.Dense> tanhCache)
     {
         float x = input[index];
-        // Approximation из оригинального GPT-2 / transformer libraries
-        float coeff = 0.044715f;
-        float sqrt2OverPi = 0.7978845608f; // sqrt(2/π)
-        float inner = sqrt2OverPi * (x + coeff * x * x * x);
-        float tanh = XMath.Tanh(inner);
-        output[index] = 0.5f * x * (1.0f + tanh);
+        float inner = Sqrt2OverPi * (x + Coeff * x * x * x);
+        float t = XMath.Tanh(inner);
+        tanhCache[index] = t;
+        output[index] = 0.5f * x * (1.0f + t);
     }
 
-    /// <summary>
-    /// GELU backward pass.
-    /// dy/dx = 0.5*(1+tanh) + 0.5*x*(1-tanh²)*coeff*(1+3*coeff*x²)
-    /// </summary>
     public static void GELUBackwardKernel(
         Index1D index,
         ArrayView1D<float, Stride1D.Dense> gradOutput,
         ArrayView1D<float, Stride1D.Dense> input,
+        ArrayView1D<float, Stride1D.Dense> tanhCache,
         ArrayView1D<float, Stride1D.Dense> gradInput)
     {
         float x = input[index];
-        float coeff = 0.044715f;
-        float sqrt2OverPi = 0.7978845608f;
-        float inner = sqrt2OverPi * (x + coeff * x * x * x);
-        float tanh = XMath.Tanh(inner);
-        float tanhSq = tanh * tanh;
-
-        // Производная GELU
-        float dGelu = 0.5f * (1.0f + tanh)
-                    + 0.5f * x * (1.0f - tanhSq)
-                    * sqrt2OverPi * (1.0f + 3.0f * coeff * x * x);
-
+        float t = tanhCache[index];
+        float tanhSq = t * t;
+        float dGelu = 0.5f * (1.0f + t)
+                     + 0.5f * x * (1.0f - tanhSq)
+                     * Sqrt2OverPi * (1.0f + 3.0f * Coeff * x * x);
         gradInput[index] = gradOutput[index] * dGelu;
+    }
+
+    // ── НОВЫЙ: объединённый kernel W1→GELU за один проход ────────
+    // Применяет GELU к уже вычисленному W1 output in-place.
+    // Это позволяет избежать отдельного CopyFrom (GPU→GPU копии).
+    // Используется когда W1.Forward возвращает view в _outputBuffer W1,
+    // который мы можем использовать напрямую без копирования.
+    public static void GELUInPlaceKernel(
+        Index1D index,
+        ArrayView1D<float, Stride1D.Dense> data,     // W1 output (in-place)
+        ArrayView1D<float, Stride1D.Dense> tanhCache,
+        ArrayView1D<float, Stride1D.Dense> inputCache) // кэш pre-GELU для backward
+    {
+        float x = data[index];
+        inputCache[index] = x;                        // сохраняем pre-GELU
+        float inner = Sqrt2OverPi * (x + Coeff * x * x * x);
+        float t = XMath.Tanh(inner);
+        tanhCache[index] = t;
+        data[index] = 0.5f * x * (1.0f + t);    // in-place GELU
     }
 }
 
-/// <summary>
-/// GPT-2 совместимый Feed-Forward слой с GELU активацией.
-/// 
-/// Формула: output = W2 · GELU(W1 · x + b1) + b2
-/// 
-/// Отличия от FeedForwardLayer (ReLU):
-///   - GELU вместо ReLU (гладкая аппроксимация)
-///   - Стандарт для GPT-2 / BERT / современных трансформеров
-/// </summary>
-public class GELUFeedForwardLayer : IDisposable
+public class GELUFeedForwardLayer : ILayer
 {
     private readonly Accelerator _accelerator;
     private readonly int _embeddingDim;
     private readonly int _hiddenDim;
     private readonly int _maxSeqLen;
 
-    /// <summary>W1: embedding → hidden (с bias)</summary>
     public LinearLayer W1 { get; }
-
-    /// <summary>W2: hidden → embedding (с bias)</summary>
     public LinearLayer W2 { get; }
 
-    // Промежуточные буферы
-    private MemoryBuffer1D<float, Stride1D.Dense> _hiddenPreGelu;
-    private MemoryBuffer1D<float, Stride1D.Dense> _hiddenPostGelu;
-    private MemoryBuffer1D<float, Stride1D.Dense> _cachedInput;
-    private int _cachedSeqLen;
+    // ── Буферы ───────────────────────────────────────────────────
+    // _hiddenPreGelu: кэш входа GELU (нужен для backward)
+    // _tanhCache:     кэш tanh (нужен для backward без пересчёта)
+    // _gradPreGelu:   буфер для градиента через GELU
+    // _hiddenPostGelu УБРАН — теперь делаем GELU in-place в буфере W1
+    private readonly MemoryBuffer1D<float, Stride1D.Dense> _hiddenPreGelu;
+    private readonly MemoryBuffer1D<float, Stride1D.Dense> _tanhCache;
+    private readonly MemoryBuffer1D<float, Stride1D.Dense> _gradPreGelu;
 
-    // Кернелы
-    private readonly Action<Index1D, ArrayView1D<float, Stride1D.Dense>,
+    private int _cachedSeqLen;
+    // Кэшируем view результата W1 (используется в backward как gradHidden)
+    private ArrayView1D<float, Stride1D.Dense> _cachedW1OutputView;
+
+    private readonly Action<Index1D,
+        ArrayView1D<float, Stride1D.Dense>,
+        ArrayView1D<float, Stride1D.Dense>,
         ArrayView1D<float, Stride1D.Dense>> _geluForwardKernel;
 
-    private readonly Action<Index1D, ArrayView1D<float, Stride1D.Dense>,
+    private readonly Action<Index1D,
+        ArrayView1D<float, Stride1D.Dense>,
+        ArrayView1D<float, Stride1D.Dense>,
         ArrayView1D<float, Stride1D.Dense>,
         ArrayView1D<float, Stride1D.Dense>> _geluBackwardKernel;
 
+    // ── НОВЫЙ kernel: in-place GELU ───────────────────────────────
+    private readonly Action<Index1D,
+        ArrayView1D<float, Stride1D.Dense>,
+        ArrayView1D<float, Stride1D.Dense>,
+        ArrayView1D<float, Stride1D.Dense>> _geluInPlaceKernel;
+
     private bool _disposed;
 
-    public GELUFeedForwardLayer(Accelerator accelerator, int embeddingDim,
-        int hiddenDim, int maxSeqLen)
+    public GELUFeedForwardLayer(
+        Accelerator accelerator,
+        int embeddingDim,
+        int hiddenDim,
+        int maxSeqLen)
     {
+        if (accelerator == null) throw new ArgumentNullException(nameof(accelerator));
+        if (embeddingDim <= 0) throw new ArgumentOutOfRangeException(nameof(embeddingDim));
+        if (hiddenDim <= 0) throw new ArgumentOutOfRangeException(nameof(hiddenDim));
+        if (maxSeqLen <= 0) throw new ArgumentOutOfRangeException(nameof(maxSeqLen));
+
         _accelerator = accelerator;
         _embeddingDim = embeddingDim;
         _hiddenDim = hiddenDim;
         _maxSeqLen = maxSeqLen;
 
-        // GPT-2 FFN использует bias
         W1 = new LinearLayer(accelerator, embeddingDim, hiddenDim, true, maxSeqLen);
         W2 = new LinearLayer(accelerator, hiddenDim, embeddingDim, true, maxSeqLen);
 
-        int hiddenSize = maxSeqLen * hiddenDim;
-        _hiddenPreGelu = accelerator.Allocate1D<float>(hiddenSize);
-        _hiddenPostGelu = accelerator.Allocate1D<float>(hiddenSize);
-        _cachedInput = accelerator.Allocate1D<float>(maxSeqLen * embeddingDim);
+        int maxHiddenSize = maxSeqLen * hiddenDim;
 
-        _geluForwardKernel = accelerator.LoadAutoGroupedStreamKernel<Index1D,
-            ArrayView1D<float, Stride1D.Dense>,
-            ArrayView1D<float, Stride1D.Dense>>(
-            GELUKernels.GELUForwardKernel);
+        // _hiddenPostGelu убран: GELU теперь in-place в буфере W1
+        _hiddenPreGelu = accelerator.Allocate1D<float>(maxHiddenSize);
+        _tanhCache = accelerator.Allocate1D<float>(maxHiddenSize);
+        _gradPreGelu = accelerator.Allocate1D<float>(maxHiddenSize);
 
-        _geluBackwardKernel = accelerator.LoadAutoGroupedStreamKernel<Index1D,
+        _geluForwardKernel = accelerator.LoadAutoGroupedStreamKernel<
+            Index1D,
             ArrayView1D<float, Stride1D.Dense>,
             ArrayView1D<float, Stride1D.Dense>,
-            ArrayView1D<float, Stride1D.Dense>>(
-            GELUKernels.GELUBackwardKernel);
+            ArrayView1D<float, Stride1D.Dense>>(GELUKernels.GELUForwardKernel);
+
+        _geluBackwardKernel = accelerator.LoadAutoGroupedStreamKernel<
+            Index1D,
+            ArrayView1D<float, Stride1D.Dense>,
+            ArrayView1D<float, Stride1D.Dense>,
+            ArrayView1D<float, Stride1D.Dense>,
+            ArrayView1D<float, Stride1D.Dense>>(GELUKernels.GELUBackwardKernel);
+
+        _geluInPlaceKernel = accelerator.LoadAutoGroupedStreamKernel<
+            Index1D,
+            ArrayView1D<float, Stride1D.Dense>,
+            ArrayView1D<float, Stride1D.Dense>,
+            ArrayView1D<float, Stride1D.Dense>>(GELUKernels.GELUInPlaceKernel);
     }
 
     public string LayerType => "GELUFFN";
 
-    /// <summary>
-    /// Прямой проход: x → W1 → GELU → W2 → output
-    /// </summary>
     public ArrayView1D<float, Stride1D.Dense> Forward(
         ArrayView1D<float, Stride1D.Dense> input, int seqLen)
     {
+        if (seqLen <= 0 || seqLen > _maxSeqLen)
+            throw new ArgumentOutOfRangeException(nameof(seqLen));
+
         _cachedSeqLen = seqLen;
-        int inputSize = seqLen * _embeddingDim;
-
-        // Кэшируем вход для backward
-        _cachedInput.View.SubView(0, inputSize)
-            .CopyFrom(input.SubView(0, inputSize));
-
-        // W1: embedding → hidden
-        var hiddenPre = W1.Forward(input, seqLen);
         int hiddenSize = seqLen * _hiddenDim;
-        _hiddenPreGelu.View.SubView(0, hiddenSize)
-            .CopyFrom(hiddenPre.SubView(0, hiddenSize));
 
-        // GELU активация
-        _geluForwardKernel(hiddenSize,
-            _hiddenPreGelu.View.SubView(0, hiddenSize),
-            _hiddenPostGelu.View.SubView(0, hiddenSize));
+        // W1 forward: embeddingDim → hiddenDim
+        // Результат живёт в _outputBuffer внутри W1
+        var w1Out = W1.Forward(input, seqLen);
 
-        // W2: hidden → embedding
-        return W2.Forward(_hiddenPostGelu.View.SubView(0, hiddenSize), seqLen);
+        // ── ОПТИМИЗАЦИЯ: GELU in-place, без CopyFrom ─────────────
+        // Оригинал: preGeluView.CopyFrom(hiddenPre) → лишняя GPU→GPU копия
+        // Новый код: GELUInPlaceKernel пишет в w1Out напрямую,
+        // параллельно сохраняя pre-GELU в _hiddenPreGelu и tanh в _tanhCache
+        var preGeluView = _hiddenPreGelu.View.SubView(0, hiddenSize);
+        var tanhView = _tanhCache.View.SubView(0, hiddenSize);
+
+        _geluInPlaceKernel(hiddenSize, w1Out, tanhView, preGeluView);
+
+        // Сохраняем view для backward (w1Out теперь содержит post-GELU)
+        _cachedW1OutputView = w1Out;
+
+        // W2: hiddenDim → embeddingDim
+        return W2.Forward(w1Out, seqLen);
     }
 
-    /// <summary>
-    /// Обратный проход.
-    /// </summary>
     public ArrayView1D<float, Stride1D.Dense> Backward(
         ArrayView1D<float, Stride1D.Dense> gradOutput, float lr)
     {
@@ -169,18 +192,20 @@ public class GELUFeedForwardLayer : IDisposable
         // Gradient через W2
         var gradHidden = W2.Backward(gradOutput, lr);
 
-        // Gradient через GELU
-        var gradPreGelu = _accelerator.Allocate1D<float>(hiddenSize);
-        _geluBackwardKernel(hiddenSize,
-            gradHidden,
-            _hiddenPreGelu.View.SubView(0, hiddenSize),
-            gradPreGelu.View);
+        // Gradient через GELU (кэшированный tanh — нет пересчёта)
+        var preGeluView = _hiddenPreGelu.View.SubView(0, hiddenSize);
+        var tanhView = _tanhCache.View.SubView(0, hiddenSize);
+        var gradPreGelView = _gradPreGelu.View.SubView(0, hiddenSize);
+
+        _geluBackwardKernel(
+            hiddenSize,
+            gradHidden.SubView(0, hiddenSize),
+            preGeluView,
+            tanhView,
+            gradPreGelView);
 
         // Gradient через W1
-        var gradInput = W1.Backward(gradPreGelu.View, lr);
-
-        gradPreGelu.Dispose();
-        return gradInput;
+        return W1.Backward(gradPreGelView, lr);
     }
 
     public int Parameters() => W1.Parameters() + W2.Parameters();
@@ -189,10 +214,11 @@ public class GELUFeedForwardLayer : IDisposable
     {
         if (!_disposed)
         {
-            W1.Dispose(); W2.Dispose();
+            W1.Dispose();
+            W2.Dispose();
             _hiddenPreGelu.Dispose();
-            _hiddenPostGelu.Dispose();
-            _cachedInput.Dispose();
+            _tanhCache.Dispose();
+            _gradPreGelu.Dispose();
             _disposed = true;
         }
     }

@@ -1,5 +1,7 @@
 //https://github.com/virex-84
 
+using System.Net;
+
 namespace LLM.ILGPU;
 
 /// <summary>
@@ -50,4 +52,8 @@ public interface ILLM : IDisposable
 
     /// <summary>Описание архитектуры (цепочка слоёв).</summary>
     string NetworkDescription();
+
+    public void WarmUpInternal();
+
+    List<ILayer> GetLayers();
 }

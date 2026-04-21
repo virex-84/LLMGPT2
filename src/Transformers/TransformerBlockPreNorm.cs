@@ -2,23 +2,37 @@
 
 using ILGPU;
 using ILGPU.Runtime;
-using System;
+using ILGPU.Algorithms;
 
 namespace LLM.ILGPU;
 
-/// <summary>
-/// GPT-2 совместимый Transformer блок с Pre-LayerNorm.
-/// 
-/// Архитектура (Pre-Norm):
-///   1. x = x + Attention(LayerNorm(x))     — attention causal mask
-///   2. x = x + FFN_GELU(LayerNorm(x))      — feed-forward с GELU
-/// 
-/// Отличия от TransformerBlock (Post-Norm):
-///   - LayerNorm ПЕРЕД attention и FFN, а не после
-///   - GELU вместо ReLU
-///   - Обучаемые positional embeddings (не синусоидальные)
-///   - Causal (look-ahead) маска в attention
-/// </summary>
+public static class ResidualKernels
+{
+    // ResidualAdd in-place: residual[i] += input[i], развёртка x4
+    public static void ResidualAddKernel(
+        Index1D index,
+        ArrayView1D<float, Stride1D.Dense> residual,
+        ArrayView1D<float, Stride1D.Dense> input,
+        SpecializedValue<int> totalSize)
+    {
+        int i = index * 4;
+        int total = totalSize;
+
+        if (i + 3 < total)
+        {
+            residual[i] += input[i];
+            residual[i + 1] += input[i + 1];
+            residual[i + 2] += input[i + 2];
+            residual[i + 3] += input[i + 3];
+        }
+        else
+        {
+            for (int j = i; j < total; j++)
+                residual[j] += input[j];
+        }
+    }
+}
+
 public class TransformerBlockPreNorm : ILayer, IDisposable
 {
     private readonly Accelerator _accelerator;
@@ -27,26 +41,36 @@ public class TransformerBlockPreNorm : ILayer, IDisposable
     private readonly int _numHeads;
     private readonly int _maxSeqLen;
 
-    // Pre-Norm слои (перед attention и перед FFN)
     internal readonly LayerNormLayer _ln1;
     internal readonly MultiHeadAttentionLayer _attention;
     internal readonly LayerNormLayer _ln2;
     internal readonly GELUFeedForwardLayer _ffn;
 
-    // Буферы для residual connection
-    private MemoryBuffer1D<float, Stride1D.Dense> _residualBuffer;
-    private MemoryBuffer1D<float, Stride1D.Dense> _normOutputBuffer;
-    private int _cachedSeqLen;
-    private MemoryBuffer1D<float, Stride1D.Dense> _cachedInputBuffer;
+    // Минимальный набор буферов
+    private readonly MemoryBuffer1D<float, Stride1D.Dense> _residualBuffer;
+    private readonly MemoryBuffer1D<float, Stride1D.Dense> _attnResidualBuffer;
+    private readonly MemoryBuffer1D<float, Stride1D.Dense> _gradBuffer1;
+    private readonly MemoryBuffer1D<float, Stride1D.Dense> _gradBuffer2;
 
+    private int _cachedSeqLen;
     private bool _disposed;
+
+    private readonly Action<Index1D,
+        ArrayView1D<float, Stride1D.Dense>,
+        ArrayView1D<float, Stride1D.Dense>,
+        SpecializedValue<int>> _residualAddKernel;
 
     public int EmbeddingDim => _embeddingDim;
     public int HiddenDim => _hiddenDim;
     public int NumHeads => _numHeads;
+    public string LayerType => "TransformerBlockPreNorm";
 
-    public TransformerBlockPreNorm(Accelerator accelerator, int embeddingDim,
-        int numHeads, int hiddenDim, int maxSeqLen)
+    public TransformerBlockPreNorm(
+        Accelerator accelerator,
+        int embeddingDim,
+        int numHeads,
+        int hiddenDim,
+        int maxSeqLen)
     {
         _accelerator = accelerator;
         _embeddingDim = embeddingDim;
@@ -54,86 +78,85 @@ public class TransformerBlockPreNorm : ILayer, IDisposable
         _hiddenDim = hiddenDim;
         _maxSeqLen = maxSeqLen;
 
-        // Pre-LayerNorm слои
         _ln1 = new LayerNormLayer(accelerator, embeddingDim, maxSeqLen);
         _attention = new MultiHeadAttentionLayer(
-            accelerator, embeddingDim, numHeads, maxSeqLen);
+                         accelerator, embeddingDim, numHeads, maxSeqLen);
         _ln2 = new LayerNormLayer(accelerator, embeddingDim, maxSeqLen);
         _ffn = new GELUFeedForwardLayer(
-            accelerator, embeddingDim, hiddenDim, maxSeqLen);
+                         accelerator, embeddingDim, hiddenDim, maxSeqLen);
 
-        // Буферы
         int bufferSize = maxSeqLen * embeddingDim;
+
+        // Только необходимые буферы
         _residualBuffer = accelerator.Allocate1D<float>(bufferSize);
-        _normOutputBuffer = accelerator.Allocate1D<float>(bufferSize);
-        _cachedInputBuffer = accelerator.Allocate1D<float>(bufferSize);
+        _attnResidualBuffer = accelerator.Allocate1D<float>(bufferSize);
+        _gradBuffer1 = accelerator.Allocate1D<float>(bufferSize);
+        _gradBuffer2 = accelerator.Allocate1D<float>(bufferSize);
+
+        _residualAddKernel = accelerator.LoadAutoGroupedStreamKernel<
+            Index1D,
+            ArrayView1D<float, Stride1D.Dense>,
+            ArrayView1D<float, Stride1D.Dense>,
+            SpecializedValue<int>>(
+            ResidualKernels.ResidualAddKernel);
     }
 
-    public string LayerType => "TransformerBlockPreNorm";
-
-    /// <summary>
-    /// Прямой проход GPT-2 Pre-Norm Transformer блока.
-    /// 
-    /// flow:
-    ///   residual = input
-    ///   x = LN1(input)
-    ///   x = Attention(x)  ← с causal mask
-    ///   x = residual + x
-    ///   residual = x
-    ///   x = LN2(x)
-    ///   x = FFN_GELU(x)
-    ///   output = residual + x
-    /// </summary>
+    // ─────────────────────────────────────────────────────────────
+    // Forward:
+    //   residual1 = input                    (через .CopyFrom — DMA)
+    //   x         = Attention(LN1(input))
+    //   x         = residual1 + x            (ResidualAdd kernel)
+    //   residual2 = x                        (через .CopyFrom — DMA)
+    //   x         = FFN(LN2(x))
+    //   output    = residual2 + x            (ResidualAdd kernel)
+    // ─────────────────────────────────────────────────────────────
     public ArrayView1D<float, Stride1D.Dense> Forward(
         ArrayView1D<float, Stride1D.Dense> input, int seqLen)
     {
         _cachedSeqLen = seqLen;
         int totalDim = seqLen * _embeddingDim;
+        int threads = (totalDim + 3) / 4;
 
-        // Кэшируем вход для backward
-        _cachedInputBuffer.View.SubView(0, totalDim)
-            .CopyFrom(input.SubView(0, totalDim));
+        var residualSub = _residualBuffer.View.SubView(0, totalDim);
+        var attnResSub = _attnResidualBuffer.View.SubView(0, totalDim);
+        var inputSub = input.SubView(0, totalDim);
 
-        // ─── Attention Block ───
-        
-        // Сохраняем residual
-        _residualBuffer.View.SubView(0, totalDim)
-            .CopyFrom(input.SubView(0, totalDim));
+        // ── Attention Block ──────────────────────────────────────
 
-        // LayerNorm перед attention
-        var normed = _ln1.Forward(input, seqLen);
+        // residual1 = input (встроенный DMA-копировщик — быстрее kernel)
+        residualSub.CopyFrom(inputSub);
 
-        // Attention (с causal mask)
-        var attnOut = _attention.Forward(normed, seqLen);
+        // LN1 → Attention
+        var ln1Out = _ln1.Forward(inputSub, seqLen);
+        var attnOut = _attention.Forward(ln1Out, seqLen);
 
-        // Residual Add: input + attention
-        ResidualAdd(_residualBuffer.View.SubView(0, totalDim),
-            attnOut, seqLen * _embeddingDim);
+        // residual1 + attnOut (in-place kernel)
+        _residualAddKernel(threads, residualSub, attnOut,
+            SpecializedValue.New(totalDim));
 
-        // ─── FFN Block ───
+        // ── FFN Block ────────────────────────────────────────────
 
-        // Сохраняем текущий residual (input + attention)
-        var attnResidual = _accelerator.Allocate1D<float>(totalDim);
-        attnResidual.View.SubView(0, totalDim)
-            .CopyFrom(_residualBuffer.View.SubView(0, totalDim));
+        // residual2 = residual1 + attnOut (DMA копия для Backward)
+        attnResSub.CopyFrom(residualSub);
 
-        // LayerNorm перед FFN
-        var normed2 = _ln2.Forward(_residualBuffer.View.SubView(0, totalDim), seqLen);
+        // LN2 → FFN
+        var ln2Out = _ln2.Forward(residualSub, seqLen);
+        var ffnOut = _ffn.Forward(ln2Out, seqLen);
 
-        // FFN с GELU
-        var ffnOut = _ffn.Forward(normed2, seqLen);
+        // residual2 + ffnOut (in-place kernel)
+        _residualAddKernel(threads, residualSub, ffnOut,
+            SpecializedValue.New(totalDim));
 
-        // Final Residual Add: (input+attn) + ffn
-        ResidualAdd(_residualBuffer.View.SubView(0, totalDim),
-            ffnOut, seqLen * _embeddingDim);
-
-        attnResidual.Dispose();
-        return _residualBuffer.View.SubView(0, totalDim);
+        return residualSub;
     }
 
-    /// <summary>
-    /// Обратный проход.
-    /// </summary>
+    // ─────────────────────────────────────────────────────────────
+    // Backward:
+    //   gradOutput → FFN.Backward → LN2.Backward
+    //   + residual2 pass-through
+    //   → Attention.Backward → LN1.Backward
+    //   + residual1 pass-through
+    // ─────────────────────────────────────────────────────────────
     public ArrayView1D<float, Stride1D.Dense> Backward(
         ArrayView1D<float, Stride1D.Dense> gradOutput, float lr)
     {
@@ -143,44 +166,41 @@ public class TransformerBlockPreNorm : ILayer, IDisposable
 
         int seqLen = _cachedSeqLen;
         int totalDim = seqLen * _embeddingDim;
+        int threads = (totalDim + 3) / 4;
 
-        // Gradient через FFN
-        var gradFfnIn = _ffn.Backward(gradOutput, lr);
+        var grad1Sub = _gradBuffer1.View.SubView(0, totalDim);
+        var grad2Sub = _gradBuffer2.View.SubView(0, totalDim);
 
-        // Gradient через LN2
-        // (упрощённо — пропускаем)
+        // ── FFN branch ──────────────────────────────────────────
 
-        // Gradient через Attention
-        var gradAttnIn = _attention.Backward(gradOutput, lr);
+        // Grad через FFN + LN2
+        var gradAfterFfn = _ffn.Backward(gradOutput, lr);
+        var gradAfterLn2 = _ln2.Backward(gradAfterFfn, lr);
 
-        // Gradient через LN1
-        // (упрощённо — пропускаем)
+        // Residual2: grad1 = gradOutput + gradAfterLn2
+        grad1Sub.CopyFrom(gradOutput.SubView(0, totalDim));
+        _residualAddKernel(threads, grad1Sub, gradAfterLn2,
+            SpecializedValue.New(totalDim));
 
-        return gradFfnIn;
+        // ── Attention branch ────────────────────────────────────
+
+        // Grad через Attention + LN1
+        var gradAfterAttn = _attention.Backward(grad1Sub, lr);
+        var gradAfterLn1 = _ln1.Backward(gradAfterAttn, lr);
+
+        // Residual1: grad2 = grad1 + gradAfterLn1
+        grad2Sub.CopyFrom(grad1Sub);
+        _residualAddKernel(threads, grad2Sub, gradAfterLn1,
+            SpecializedValue.New(totalDim));
+
+        return grad2Sub;
     }
 
     public int Parameters() =>
-        _ln1.Parameters() + _attention.Parameters() +
-        _ln2.Parameters() + _ffn.Parameters();
-
-    /// <summary>
-    /// Residual connection: output = residual + input (in-place).
-    /// </summary>
-    private void ResidualAdd(
-        ArrayView1D<float, Stride1D.Dense> residual,
-        ArrayView1D<float, Stride1D.Dense> input,
-        int size)
-    {
-        var residHost = new float[size];
-        var inputHost = new float[size];
-        residual.CopyToCPU(residHost);
-        input.CopyToCPU(inputHost);
-
-        for (int i = 0; i < size; i++)
-            residHost[i] += inputHost[i];
-
-        residual.CopyFromCPU(residHost);
-    }
+        _ln1.Parameters() +
+        _attention.Parameters() +
+        _ln2.Parameters() +
+        _ffn.Parameters();
 
     public void Dispose()
     {
@@ -191,8 +211,9 @@ public class TransformerBlockPreNorm : ILayer, IDisposable
             _ln2.Dispose();
             _ffn.Dispose();
             _residualBuffer.Dispose();
-            _normOutputBuffer.Dispose();
-            _cachedInputBuffer.Dispose();
+            _attnResidualBuffer.Dispose();
+            _gradBuffer1.Dispose();
+            _gradBuffer2.Dispose();
             _disposed = true;
         }
     }
