@@ -919,6 +919,8 @@ class Program
 
         try
         {
+            Directory.CreateDirectory(Path.GetDirectoryName(path)!);
+
             if (llm is LLMGPT2 gpt2Model)
                 GgufExporter.Export(gpt2Model, tokenizer, path, name);
             else
