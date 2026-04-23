@@ -135,16 +135,14 @@ public class LLMGPT2 : ILLM
         return Tokenizer.Decode(outputTokens);
     }
 
-    public string PredictWithLimit(
-        string userInput,
-        float temperature = 0.7f,
-        int? maxSeqLimit = null)
-        => Predict(userInput, temperature);
-
     // ═══════════════════════════════════════════════════════
     // ОБУЧЕНИЕ
     // ═══════════════════════════════════════════════════════
 
+    /// <summary>
+    /// Обычное обучение
+    /// Обновляет веса после каждого примера
+    /// </summary>
     public float TrainStep(List<int> tokens, float lr)
     {
         if (tokens.Count < 2) return 0f;
@@ -202,55 +200,74 @@ public class LLMGPT2 : ILLM
     {
         if (batch.Count == 0) return 0f;
 
-        float totalLoss = 0f;
-        int validSamples = 0;
-        float gradScale = 1.0f / batch.Count;
-
+        // ── Фильтрация валидных примеров ──────────────────────────
+        var valid = new List<(List<int> tokens, int seqLen)>();
         foreach (var tokens in batch)
         {
             if (tokens.Count < 2) continue;
-
             int seqLen = Math.Min(tokens.Count - 1, MaxSeqLen);
+            valid.Add((tokens, seqLen));
+        }
 
+        if (valid.Count == 0) return 0f;
+
+        int N = valid.Count;
+        float scaledLr = lr / N;  // ← ключевое: lr/N за шаг = lr суммарно
+        float totalLoss = 0f;
+        int padId = Tokenizer.PadId;
+
+        for (int s = 0; s < N; s++)
+        {
+            var (tokens, seqLen) = valid[s];
+
+            // ── Заполняем буферы ──────────────────────────────────
             for (int i = 0; i < seqLen; i++)
             {
                 _pinnedInputCpu[i] = tokens[i];
                 _pinnedTargetCpu[i] = tokens[i + 1];
             }
+            // Явно заполняем остаток PAD — буфер мог содержать старые данные
+            for (int i = seqLen; i < MaxSeqLen; i++)
+            {
+                _pinnedInputCpu[i] = padId;
+                _pinnedTargetCpu[i] = padId;
+            }
 
             CopyTokensToGpu(_pinnedInputCpu, seqLen, _inputIdsBuffer);
             CopyTokensToGpu(_pinnedTargetCpu, seqLen, _targetIdsBuffer);
 
+            // ── Forward ───────────────────────────────────────────
             var logits = RunForward(seqLen);
 
+            // ── Loss ──────────────────────────────────────────────
             var (probsView, loss) = _lossManager.ComputeSoftmaxAndLoss(
                 logits,
                 _targetIdsBuffer.View.SubView(0, seqLen),
                 seqLen);
 
             totalLoss += loss;
-            validSamples++;
 
+            // ── Градиент ──────────────────────────────────────────
             var gradsView = _lossManager.ComputeGradients(
                 probsView,
                 _targetIdsBuffer.View.SubView(0, seqLen),
                 seqLen);
 
-            // Масштабируем градиент на 1/batchSize
-            MatrixOps.ScaleGradients(_accelerator, gradsView, gradScale);
+            MatrixOps.ClipGradients(_accelerator, gradsView, 1.0f, _gradNormBuffer);
 
-            MatrixOps.ClipGradients(
-                _accelerator, gradsView, 1.0f, _gradNormBuffer);
-
+            // ── Backward с lr/N ───────────────────────────────────
+            // Математически эквивалентно gradient accumulation при SGD:
+            //   Δw = -lr * (1/N) * Σ grad_i
+            //      = -lr/N * grad_1 + (-lr/N * grad_2) + ...
             var gradView = gradsView;
             for (int i = _network.Count - 1; i >= 0; i--)
-                gradView = _network[i].Backward(gradView, lr);
+                gradView = _network[i].Backward(gradView, scaledLr);
         }
 
         // Один Synchronize на весь батч
         _accelerator.Synchronize();
 
-        return validSamples > 0 ? totalLoss / validSamples : 0f;
+        return totalLoss / N;
     }
 
     // ═══════════════════════════════════════════════════════

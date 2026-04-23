@@ -589,52 +589,73 @@ class Program
     // ═══════════════════════════════════════════════════════════
 
     static void TrainPhaseWithSchedule(
-        ILLM llm, List<List<int>> tokenizedData,
-        int epochs, float baseLr, string phase,
-        int warmupStepsOverride = 0)   // ← новый параметр из конфига
+            ILLM llm, List<List<int>> tokenizedData,
+            int epochs, float baseLr, string phase,
+            int warmupStepsOverride = 0,
+            int batchSize = 4)          // ← новый параметр, по умолчанию 4
     {
-        int totalSteps = epochs * tokenizedData.Count;
+        int totalSteps = epochs * (int)Math.Ceiling(
+            (double)tokenizedData.Count / batchSize); // шаги теперь по батчам
 
-        // Если warmup передан из конфига — используем его.
-        // Иначе fallback: 7% от total, но не более 300.
         int warmupSteps = warmupStepsOverride > 0
             ? warmupStepsOverride
             : Math.Clamp(totalSteps / 14, 10, 300);
 
         int globalStep = 0;
 
-        Console.WriteLine($"  Warmup steps: {warmupSteps}");
-        Console.WriteLine($"  Total steps:  {totalSteps}");
-        Console.WriteLine($"  Base LR:      {baseLr}\n");
+        Console.WriteLine($" Batch size:   {batchSize}");
+        Console.WriteLine($" Warmup steps: {warmupSteps}");
+        Console.WriteLine($" Total steps:  {totalSteps}");
+        Console.WriteLine($" Base LR:      {baseLr}\n");
 
         for (int epoch = 0; epoch < epochs; epoch++)
         {
             float totalLoss = 0f;
-            int validCount = 0;
+            int batchCount = 0;
 
+            // Перемешиваем примеры
             var shuffled = tokenizedData
                 .OrderBy(_ => Random.Shared.Next())
                 .ToList();
 
-            foreach (var tokens in shuffled)
+            // Разбиваем на батчи
+            for (int bStart = 0; bStart < shuffled.Count; bStart += batchSize)
             {
-                if (tokens.Count < 2) continue;
-                validCount++;
-                globalStep++;
+                // Берём срез [bStart .. bStart+batchSize)
+                var batch = shuffled
+                    .Skip(bStart)
+                    .Take(batchSize)
+                    .Where(t => t.Count >= 2)
+                    .ToList();
 
-                float lr = ComputeLearningRate(baseLr, globalStep, warmupSteps, totalSteps);
-                float loss = llm.TrainStep(tokens, lr);
+                if (batch.Count == 0) continue;
+
+                globalStep++;
+                batchCount++;
+
+                // LR с warmup + cosine decay считаем по шагу батча
+                float lr = ComputeLearningRate(
+                    baseLr, globalStep, warmupSteps, totalSteps);
+
+                // ── Gradient accumulation через TrainBatch ──────────
+                // TrainBatch внутри делает lr/N на каждый пример
+                float loss = llm.TrainBatch(batch, lr);
                 totalLoss += loss;
             }
 
-            if (validCount > 0 &&
+            // Логируем каждые 5 эпох и последнюю
+            if (batchCount > 0 &&
                 (epoch % 5 == 0 || epoch == epochs - 1))
             {
-                float avgLoss = totalLoss / validCount;
-                float currentLr = ComputeLearningRate(baseLr, globalStep, warmupSteps, totalSteps);
+                float avgLoss = totalLoss / batchCount;
+                float currentLr = ComputeLearningRate(
+                    baseLr, globalStep, warmupSteps, totalSteps);
+
                 Console.WriteLine(
-                    $"  [{phase}] Epoch {epoch,3}/{epochs}: " +
-                    $"Loss = {avgLoss:F4}, LR = {currentLr:E2}");
+                    $" [{phase}] Epoch {epoch,3}/{epochs}: " +
+                    $"Loss = {avgLoss:F4}, " +
+                    $"LR = {currentLr:E2}, " +
+                    $"Batches = {batchCount}");
             }
         }
     }
@@ -721,6 +742,32 @@ class Program
         }
     }
 
+    /// <summary>
+    /// Вычисляет оптимальный batch size на основе количества примеров.
+    /// Формула: clamp(2^floor(log2(√N)), minBatch, maxBatch)
+    /// </summary>
+    public static int ComputeOptimalBatchSize(
+        int sampleCount,
+        int minBatch = 1,
+        int maxBatch = 32)
+    {
+        if (sampleCount <= 0)
+            return minBatch;
+
+        // √N
+        double sqrtN = Math.Sqrt(sampleCount);
+
+        // log2(√N) = log2(N) / 2
+        double log2 = Math.Log2(sqrtN);
+
+        // floor → степень двойки
+        int power = (int)Math.Floor(log2);
+        int batchSize = 1 << power;   // 2^power
+
+        // clamp в допустимый диапазон
+        return Math.Clamp(batchSize, minBatch, maxBatch);
+    }
+
     static void TrainSinglePhase(
         ILLM llm, ITokenizer tokenizer,
         List<string> texts, string phaseName,
@@ -729,15 +776,20 @@ class Program
         Console.WriteLine($"\n═══ {phaseName.ToUpper()} ═══");
         Console.WriteLine($"Примеров: {texts.Count}\n");
 
+        var tokenized = TokenizeDataset(texts, tokenizer, maxSeqLen);
+        Console.WriteLine($"Валидных примеров: {tokenized.Count}");
+
+        int autoBatch = ComputeOptimalBatchSize(tokenized.Count);
+
+        int batchSize = ReadIntWithDefault(
+            "Количество батчей", autoBatch, 1);
+
         int epochs = ReadIntWithDefault(
             "Количество эпох", defaultEpochs, 1, 10000);
         float lr = ReadFloatWithDefault("Learning rate", defaultLr);
 
-        var tokenized = TokenizeDataset(texts, tokenizer, maxSeqLen);
-        Console.WriteLine($"Валидных примеров: {tokenized.Count}");
-
         if (tokenized.Count > 0)
-            TrainPhaseWithSchedule(llm, tokenized, epochs, lr, phaseName);
+            TrainPhaseWithSchedule(llm, tokenized, epochs, lr, phaseName, batchSize: batchSize);
         else
             Console.WriteLine("Нет валидных примеров для обучения.");
     }

@@ -31,12 +31,6 @@ public interface ILLM : IDisposable
     /// <returns>Сгенерированный текст.</returns>
     string Predict(string userInput, float temperature = 0.7f);
 
-    /// <summary>
-    /// Генерирует ответ с дополнительным ограничением на длину.
-    /// </summary>
-    string PredictWithLimit(string userInput, float temperature = 0.7f,
-        int? maxSeqLimit = null);
-
     // ═══ Обучение ═══
 
     /// <summary>
@@ -44,6 +38,8 @@ public interface ILLM : IDisposable
     /// Возвращает значение loss.
     /// </summary>
     float TrainStep(List<int> tokens, float lr);
+
+    float TrainBatch(List<List<int>> batch, float lr);
 
     // ═══ Информация ═══
 
